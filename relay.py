@@ -14,6 +14,13 @@ Protocol
   server -> player: {"t": "peer", "id": n}  {"t": "left", "id": n}  {"t": "closed"}  {"t": "error", "msg": "..."}
   binary frames: player -> server  [int32 target][uint8 flags][data]   (target 0 = all, -n = all except n)
                  server -> player  [int32 sender][uint8 flags][data]
+
+Online leaderboard (plain HTTP):
+  GET  /scores                          -> {"lists": {category: [top 10 entries]}}
+  POST /scores  {"entries": [...]}      -> the same, after adding the entries
+  An entry: {"id", "name", "pts", "cat", "map", "board", "date", "ver"}.  The free Render server forgets
+  everything when it falls asleep, so every game sends back the lists it saw last time: the leaderboard
+  rebuilds itself as soon as players come back.
 """
 import asyncio
 import base64
@@ -29,6 +36,86 @@ MAX_PLAYERS = 8
 MAX_FRAME = 1 << 20
 
 rooms = {}   # code -> Room
+
+# ---------------- leaderboard ----------------
+CATEGORIES = ("free", "attack2", "attack5")
+MAPS = ("slope", "laax", "zermatt")
+TOP = 10
+KEEP = 200            # entries kept per category
+SCORES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scores.json")
+scores = {}           # id -> entry
+
+
+def clean_entry(e):
+    """a valid leaderboard entry, or None"""
+    if not isinstance(e, dict):
+        return None
+    eid = str(e.get("id", ""))
+    if not (8 <= len(eid) <= 40) or not eid.isalnum():
+        return None
+    name = " ".join(str(e.get("name", "")).split())[:16]
+    pts = e.get("pts")
+    if not name or isinstance(pts, bool) or not isinstance(pts, (int, float)) or not (0 < pts <= 5_000_000):
+        return None
+    cat = e.get("cat")
+    if cat not in CATEGORIES:
+        return None
+    mp = e.get("map") if e.get("map") in MAPS else "slope"
+    date = str(e.get("date", ""))[:10]
+    return {"id": eid, "name": name, "pts": int(pts), "cat": cat, "map": mp, "board": bool(e.get("board", False)),
+            "date": date, "ver": str(e.get("ver", ""))[:8]}
+
+
+def add_scores(entries):
+    changed = False
+    for e in entries[:400]:
+        c = clean_entry(e)
+        if c is not None and c["id"] not in scores:
+            scores[c["id"]] = c
+            changed = True
+    if changed:
+        # keep only the best KEEP per category
+        for cat in CATEGORIES:
+            lst = sorted((s for s in scores.values() if s["cat"] == cat), key=lambda s: -s["pts"])
+            for s in lst[KEEP:]:
+                scores.pop(s["id"], None)
+        try:
+            with open(SCORES_FILE, "w", encoding="utf-8") as f:
+                json.dump(list(scores.values()), f)
+        except OSError:
+            pass
+
+
+def top_lists():
+    """per category the 10 best, every name only once (with its best score)"""
+    out = {}
+    for cat in CATEGORIES:
+        seen = set()
+        lst = []
+        for s in sorted((s for s in scores.values() if s["cat"] == cat), key=lambda s: (-s["pts"], s["date"])):
+            key = s["name"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            lst.append(s)
+            if len(lst) >= TOP:
+                break
+        out[cat] = lst
+    return out
+
+
+def load_scores():
+    try:
+        with open(SCORES_FILE, encoding="utf-8") as f:
+            add_scores(json.load(f))
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+async def http_reply(writer, status, body, ctype="text/plain; charset=utf-8"):
+    writer.write(("HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nCache-Control: no-store\r\n"
+                  "Connection: close\r\n\r\n" % (status, ctype, len(body))).encode() + body)
+    await writer.drain()
 
 
 class Room:
@@ -201,10 +288,29 @@ async def handle(reader, writer):
                 headers[k.strip().lower()] = v.strip()
         key = headers.get("sec-websocket-key")
         if headers.get("upgrade", "").lower() != "websocket" or not key:
+            parts = lines[0].split(" ")
+            method = parts[0] if parts else ""
+            path = parts[1].split("?")[0] if len(parts) > 1 else "/"
+            if path == "/scores":
+                # online leaderboard
+                if method == "POST":
+                    n = int(headers.get("content-length", "0") or 0)
+                    if not (0 <= n <= 256 * 1024):
+                        await http_reply(writer, "413 Payload Too Large", b"too large")
+                        return
+                    raw = await asyncio.wait_for(reader.readexactly(n), 20)
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                    except ValueError:
+                        data = None
+                    if isinstance(data, dict) and isinstance(data.get("entries"), list):
+                        add_scores(data["entries"])
+                body = json.dumps({"lists": top_lists()}).encode()
+                await http_reply(writer, "200 OK", body, "application/json")
+                return
             # plain HTTP (health check, waking the server up)
-            body = ("Powder Lines Server laeuft. Raeume: %d\n" % len(rooms)).encode()
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
-            await writer.drain()
+            body = ("Powder Lines Server laeuft. Raeume: %d, Bestenliste: %d Eintraege\n" % (len(rooms), len(scores))).encode()
+            await http_reply(writer, "200 OK", body)
             return
         accept = base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
         writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -238,6 +344,7 @@ async def handle(reader, writer):
 
 async def main():
     port = int(os.environ.get("PORT", "8080"))
+    load_scores()
     server = await asyncio.start_server(handle, "0.0.0.0", port)
     print("Powder Lines relay on port", port, flush=True)
     async with server:
