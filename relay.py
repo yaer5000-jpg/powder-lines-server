@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import struct
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -39,6 +40,7 @@ rooms = {}   # code -> Room
 
 # ---------------- leaderboard ----------------
 CATEGORIES = ("free", "attack2", "attack5")
+DAILY = re.compile(r"^daily-\d{4}-\d{2}-\d{2}$")      # daily challenge: one list per day
 MAPS = ("slope", "laax", "zermatt")
 TOP = 10
 KEEP = 200            # entries kept per category
@@ -57,8 +59,8 @@ def clean_entry(e):
     pts = e.get("pts")
     if not name or isinstance(pts, bool) or not isinstance(pts, (int, float)) or not (0 < pts <= 5_000_000):
         return None
-    cat = e.get("cat")
-    if cat not in CATEGORIES:
+    cat = str(e.get("cat", ""))
+    if cat not in CATEGORIES and not DAILY.match(cat):
         return None
     mp = e.get("map") if e.get("map") in MAPS else "slope"
     date = str(e.get("date", ""))[:10]
@@ -75,7 +77,7 @@ def add_scores(entries):
             changed = True
     if changed:
         # keep only the best KEEP per category
-        for cat in CATEGORIES:
+        for cat in set(s["cat"] for s in scores.values()):
             lst = sorted((s for s in scores.values() if s["cat"] == cat), key=lambda s: -s["pts"])
             for s in lst[KEEP:]:
                 scores.pop(s["id"], None)
@@ -89,7 +91,8 @@ def add_scores(entries):
 def top_lists():
     """per category the 10 best, every name only once (with its best score)"""
     out = {}
-    for cat in CATEGORIES:
+    dailies = sorted(set(s["cat"] for s in scores.values() if DAILY.match(s["cat"])))[-3:]   # the last 3 days
+    for cat in list(CATEGORIES) + dailies:
         seen = set()
         lst = []
         for s in sorted((s for s in scores.values() if s["cat"] == cat), key=lambda s: (-s["pts"], s["date"])):
